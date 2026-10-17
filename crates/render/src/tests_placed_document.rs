@@ -132,6 +132,32 @@ fn on_screen_a_placed_document_shows_a_placeholder_then_its_bitmap() {
     }
 }
 
+/// In a CMYK document a placed document's bitmap shows the file's colours as their inks, as the
+/// document's own colours show (#1978): as drawn exactly, and as drawn by ink planes.
+#[test]
+fn in_a_cmyk_document_a_placed_documents_bitmap_shows_inks() {
+    let mut d = doc("cmyk-1");
+    d.color_mode = vectorcraft_doc::ColorMode::Cmyk;
+    render(&d, true);
+    settle();
+    let shown = render(&d, true).pixel(50, 30);
+    let exact = render(&d, false).pixel(50, 30);
+    assert_ne!(&exact[..3], &[0, 0, 255], "RGB blue separated, not the screen blue");
+    assert!(shown.iter().zip(exact).all(|(a, b)| a.abs_diff(b) <= 2), "{shown:?} vs {exact:?}");
+    let mut translucent = rect_node(Rect::new(0.0, 90.0, 10.0, 100.0));
+    translucent.opacity = 0.5;
+    let l = d.layers[0].id;
+    d.insert(Some(l), 1, translucent).unwrap();
+    let planes = render(&d, true).pixel(50, 30);
+    assert!(planes.iter().zip(exact).all(|(a, b)| a.abs_diff(b) <= 2), "{planes:?} vs {exact:?}");
+}
+
+/// A grey 10 pt rectangle at `r`'s place.
+fn rect_node(r: Rect) -> Node {
+    let grey = Appearance::basic(Paint::solid(Color::gray(0.5)), Paint::None, 0.0);
+    Node::path(NodeId(70), shapes::rectangle(r), grey)
+}
+
 #[test]
 fn copies_of_one_placed_document_share_its_bitmap() {
     let mut d = doc("shared-1");

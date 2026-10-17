@@ -10,6 +10,7 @@ use std::cell::RefCell;
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 
+use vectorcraft_color::blend::planes_cmyk;
 use vectorcraft_color::freeform::{grid_size, painted_box, spread_scale};
 use vectorcraft_color::{Color, Freeform, GradientPaint};
 use vectorcraft_geom::{Affine, Rect};
@@ -50,15 +51,20 @@ fn key(f: &Freeform, b: Rect, cols: u16, rows: u16, ink: Ink) -> u64 {
 /// Sample `f` at the centres of a `cols` × `rows` grid over `b` (premultiplied, colours as `ink`
 /// paints them).
 pub(crate) fn rasterize(f: &Freeform, b: Rect, cols: u16, rows: u16, ink: Ink) -> Pixmap {
-    let field = f.field_with(spread_scale(b), &|c| ink.rgb(c));
-    let data = field
-        .grid(b, cols, rows)
-        .map(|([r, g, bl], a)| {
-            let a = a.clamp(0.0, 1.0);
-            let q = |v: f32| (v.clamp(0.0, 1.0) * a * 255.0).round() as u8;
-            vello_cpu::color::PremulRgba8 { r: q(r), g: q(g), b: q(bl), a: (a * 255.0).round() as u8 }
-        })
-        .collect();
+    let field = |ink: Ink| f.field_with(spread_scale(b), &|c| ink.rgb(c));
+    let cell = |([r, g, bl], a): ([f32; 3], f32)| {
+        let a = a.clamp(0.0, 1.0);
+        let q = |v: f32| (v.clamp(0.0, 1.0) * a * 255.0).round() as u8;
+        vello_cpu::color::PremulRgba8 { r: q(r), g: q(g), b: q(bl), a: (a * 255.0).round() as u8 }
+    };
+    let data = if ink.press() {
+        // The ink planes mix inks: each cell shows the inks the two planes have there.
+        let (lut, _) = crate::ink::display_lut();
+        let (cmy, k) = (field(Ink::Cmy), field(Ink::K));
+        cmy.grid(b, cols, rows).zip(k.grid(b, cols, rows)).map(|((p, a), (q, _))| cell((ink.shown_by(&lut, planes_cmyk(p, q[0])), a))).collect()
+    } else {
+        field(ink).grid(b, cols, rows).map(cell).collect()
+    };
     Pixmap::from_parts(data, cols, rows)
 }
 

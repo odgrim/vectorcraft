@@ -3,8 +3,9 @@
 use super::*;
 use vectorcraft_color::blend::MASK_LUM;
 use vectorcraft_color::{BlendMode as Blend, Color, Gradient, GradientKind, GradientPaint, GradientStop, Paint};
+use vectorcraft_doc::pattern::pattern_paint;
 use vectorcraft_doc::{Appearance, ColorMode, ImageBlob, ImageObject, Node, OpacityMask};
-use vectorcraft_geom::shapes;
+use vectorcraft_geom::{Point, shapes};
 
 fn rect(d: &mut Document, r: Rect, c: Color) -> Node {
     Node::path(d.alloc_id(), shapes::rectangle(r), Appearance::basic(Paint::solid(c), Paint::None, 0.0))
@@ -98,29 +99,102 @@ fn rgb_documents_and_opaque_cmyk_documents_keep_screen_colours() {
 /// art, and kept while the document holds the same art: an edit, or a new symbol, finds it again.
 #[test]
 fn the_transparency_test_is_kept_while_the_art_stays_the_same() {
-    let frame = |r: &mut Renderer, d: &Document| r.render_region(d, d.artboards[0].rect, 1.0, true).pixels;
+    // The frame, and whether it was drawn by ink planes (composed on at least one thread).
+    let frame = |r: &mut Renderer, d: &Document| {
+        let pixels = r.render_region(d, d.artboards[0].rect, 1.0, true).pixels;
+        (pixels, r.stats.ink_threads > 0)
+    };
     let kept = |r: &Renderer| r.transparency.as_ref().map(|(art, shows)| (art.as_ptr(), *shows));
-    // The ink planes show a Gray fill lighter than screen colors do, so a frame drawn the other
-    // way differs.
     let d = doc(ColorMode::Cmyk, Some(Color::gray(0.9)), CYAN, Blend::Normal, 0.5);
     let mut r = Renderer::new();
     let first = frame(&mut r, &d);
     let found = kept(&r);
     assert_eq!(found.map(|(_, shows)| shows), Some(true));
+    assert!(first.1);
     assert!(frame(&mut r, &d) == first);
     assert_eq!(kept(&r), found, "the same art was tested again");
-    // The top object made opaque: the frame paints screen colors.
+    // The top object made opaque: the frame is drawn without ink planes.
     let mut e = d.clone();
     let top = e.layers[0].children().unwrap()[1].id;
     e.node_mut(top).unwrap().opacity = 1.0;
-    assert!(frame(&mut r, &e) == frame(&mut Renderer::new(), &e));
+    let opaque = frame(&mut r, &e);
+    assert!(!opaque.1);
+    assert!(opaque == frame(&mut Renderer::new(), &e));
     assert_eq!(kept(&r).map(|(_, shows)| shows), Some(false));
     // A symbol whose art shows transparency, placed nowhere, makes the page draw by ink planes again.
     let mut art = rect(&mut e, Rect::new(0.0, 0.0, 5.0, 5.0), CYAN);
     art.opacity = 0.5;
     e.symbols.push(vectorcraft_doc::Symbol { name: "S".into(), art: Arc::new(art) });
-    assert!(frame(&mut r, &e) == frame(&mut Renderer::new(), &e));
+    let planes = frame(&mut r, &e);
+    assert!(planes.1);
+    assert!(planes == frame(&mut Renderer::new(), &e));
     assert_eq!(kept(&r).map(|(_, shows)| shows), Some(true));
+}
+
+/// Transparency anywhere on a CMYK page changes no other colour (#1978, #1503): without it, every
+/// colour shows as the ink planes show it (RGB, Lab and Gray as the inks they separate into), and
+/// gradients mix inks between their stops as the planes do.
+#[test]
+fn transparency_elsewhere_changes_no_colour() {
+    let ramp = |a: Color, b: Color| {
+        let stops = vec![GradientStop::new(0.0, a), GradientStop::new(1.0, b)];
+        Paint::Gradient(Box::new(GradientPaint::new(Gradient { kind: GradientKind::Linear, stops })))
+    };
+    let blue = Color::rgb(0.2, 0.4, 1.0);
+    let point = |x, y, c| vectorcraft_color::FreeformPoint { spread: 0.1, ..vectorcraft_color::FreeformPoint::new(Point::new(x, y), c) };
+    let points = vec![point(4.5, 4.5, blue), point(35.5, 15.5, MAGENTA), point(35.5, 4.5, Color::gray(0.7))];
+    let mut freeform = GradientPaint::new(Gradient { kind: GradientKind::Freeform, ..Default::default() });
+    freeform.freeform = Some(vectorcraft_color::Freeform { points, ..Default::default() });
+    let mut img = image::RgbaImage::from_pixel(4, 2, image::Rgba([51, 102, 255, 255]));
+    img.put_pixel(3, 1, image::Rgba([230, 30, 120, 255]));
+    let mut png = vec![];
+    img.write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png).unwrap();
+    // The pixels compared and how far apart they may be: the planes hold 8-bit inks, which moves a
+    // ramp a few levels where a colour channel stops clipping. Freeform gradients are compared at
+    // their points and images inside their pixels: between those, colours mix on screen.
+    let across: Vec<(u32, u32)> = (1..40).step_by(3).flat_map(|x| [(x, 2), (x, 11), (x, 18)]).collect();
+    let subjects = [
+        ("RGB outside the CMYK gamut", Some(Paint::solid(blue)), &across[..], 2),
+        ("RGB inside it", Some(Paint::solid(Color::rgb(0.9, 0.6, 0.3))), &across, 2),
+        ("Gray", Some(Paint::solid(Color::gray(0.9))), &across, 2),
+        ("Lab", Some(Paint::solid(Color::lab(60.0, 70.0, -60.0))), &across, 2),
+        ("CMYK", Some(Paint::solid(CYAN)), &across, 2),
+        ("pattern", Some(pattern_paint("Blue")), &across, 2),
+        ("RGB gradient", Some(ramp(blue, Color::rgb(0.1, 0.8, 0.9))), &across, 6),
+        ("CMYK gradient", Some(ramp(CYAN, MAGENTA)), &across, 6),
+        ("RGB to CMYK gradient", Some(ramp(blue, Color::cmyk(0.0, 0.0, 1.0, 0.0))), &across, 6),
+        ("freeform gradient", Some(Paint::Gradient(Box::new(freeform))), &[(4, 4), (35, 15), (35, 4)], 2),
+        ("RGB image", None, &[(4, 4), (24, 14), (35, 15)], 2),
+    ];
+    for (name, paint, pixels, tolerance) in subjects {
+        // The subject over the top half, an unrelated grey under it.
+        let mut d = Document::new_with_mode(40.0, 40.0, ColorMode::Cmyk);
+        let tile = rect(&mut d, Rect::new(0.0, 0.0, 10.0, 10.0), blue);
+        let mut def = vectorcraft_doc::pattern::PatternDef::new("Blue", vec![Arc::new(tile)]);
+        def.tile = Rect::new(0.0, 0.0, 20.0, 20.0);
+        d.patterns.push(def);
+        d.images.insert("img".into(), ImageBlob::new("image/png", png.clone()));
+        let subject = match paint {
+            Some(p) => Node::path(d.alloc_id(), shapes::rectangle(Rect::new(0.0, 0.0, 40.0, 20.0)), Appearance::basic(p, Paint::None, 0.0)),
+            None => {
+                let im = ImageObject { key: "img".into(), width: 4, height: 2, xf: Affine::scale(10.0), link: None, placement: Default::default() };
+                Node::new(d.alloc_id(), NodeKind::Image(Box::new(im)))
+            }
+        };
+        add(&mut d, subject);
+        let grey = rect(&mut d, Rect::new(0.0, 25.0, 40.0, 40.0), Color::gray(0.5));
+        let grey_id = grey.id;
+        add(&mut d, grey);
+        let opaque = Renderer::new().render_region(&d, d.artboards[0].rect, 1.0, true);
+        d.node_mut(grey_id).unwrap().opacity = 0.83;
+        let mut r = Renderer::new();
+        let translucent = r.render_region(&d, d.artboards[0].rect, 1.0, true);
+        assert!(r.stats.ink_threads > 0, "{name}: drawn by ink planes");
+        for &(x, y) in pixels {
+            let (a, b) = (opaque.pixel(x, y), translucent.pixel(x, y));
+            assert!(near(a, b, tolerance), "{name} at ({x}, {y}): {a:?} on its own, {b:?} with transparency elsewhere");
+        }
+    }
 }
 
 /// A 200 × 150 pt CMYK page drawn by ink planes: a Gray background, translucent ellipses in each

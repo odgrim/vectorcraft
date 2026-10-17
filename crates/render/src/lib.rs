@@ -659,7 +659,7 @@ impl Renderer {
         let inv = view.inverse();
         let visible = inv.transform_rect_bbox(Rect::new(0.0, 0.0, w as f64, h as f64));
         let px = 1.0 / view.determinant().abs().sqrt().max(1e-12);
-        let screen = if opts.rich_black { Ink::RichBlack } else { Ink::Display };
+        let screen = Ink::screen(ink::shows_inks(doc, opts), opts.rich_black);
         let symbols = doc.symbol_boxes().quick();
         let frame = Frame { mt: threads > 0, doc, symbols: &symbols, view, visible, px, opts, ink: screen };
         self.begin_frame();
@@ -836,6 +836,11 @@ impl Renderer {
 
     /// Render node `n` of `doc` (its resources) into `w`×`h` transparent pixels through `view`.
     pub fn render_node(&mut self, doc: &Document, n: &Arc<Node>, w: u16, h: u16, view: Affine) -> Option<Rendered> {
+        self.render_node_as(doc, n, w, h, view, Ink::Display)
+    }
+
+    /// [`Self::render_node`], colours as `ink` paints them.
+    pub(crate) fn render_node_as(&mut self, doc: &Document, n: &Arc<Node>, w: u16, h: u16, view: Affine, ink: Ink) -> Option<Rendered> {
         self.check_plugins();
         self.check_symbols(doc);
         let inv = view.inverse();
@@ -844,7 +849,7 @@ impl Renderer {
         let mut ctx = single_threaded_context(w, h);
         let opts = RenderOptions::default();
         let symbols = doc.symbol_boxes().quick();
-        let frame = Frame { mt: false, doc, symbols: &symbols, view, visible, px, opts: &opts, ink: Ink::Display };
+        let frame = Frame { mt: false, doc, symbols: &symbols, view, visible, px, opts: &opts, ink };
         self.begin_frame();
         (self.knockout, self.nested, self.backdrop, self.picture) = (false, 0, None, None);
         self.clip_paths.clear();

@@ -332,7 +332,7 @@ fn shade_filter(blur: f64) -> Filter {
 fn shade(ink: Ink, darkness: f32) -> f32 {
     match ink {
         Ink::Cmy => 0.0,
-        Ink::K | Ink::Display | Ink::RichBlack => darkness,
+        Ink::K | Ink::Display | Ink::RichBlack | Ink::Press | Ink::PressRichBlack => darkness,
     }
 }
 
@@ -1218,6 +1218,7 @@ impl Renderer {
             Ink::Cmy => effects::pixel::Channels::CmyPlane,
             Ink::K => effects::pixel::Channels::KPlane,
             Ink::Display | Ink::RichBlack if f.doc.color_mode == vectorcraft_doc::ColorMode::Cmyk => effects::pixel::Channels::Cmyk,
+            Ink::Press | Ink::PressRichBlack => effects::pixel::Channels::Cmyk,
             Ink::Display | Ink::RichBlack => effects::pixel::Channels::Rgb,
         };
         // De-Interlace's field lines: the rows of the document's raster grid (1 to 2400 ppi).

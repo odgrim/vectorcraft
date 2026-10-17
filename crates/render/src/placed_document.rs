@@ -5,12 +5,12 @@
 //! into the document).
 //!
 //! On screen ([`RenderOptions::progressive_placed`]): a placed document can't be edited, so what
-//! it shows is cached as a bitmap per file and zoom step (a power of two, in device pixels per
-//! point), shared by every object showing that file. A bitmap not made yet is made on a
-//! background worker while the frame shows another step's bitmap, or a light placeholder;
-//! [`generation`] changes when one is ready and [`busy`] says whether any is coming, so the screen
-//! can draw again. Past [`MAX_SIDE`] pixels, and in outline, proofing and ink frames, it is drawn
-//! exactly.
+//! it shows is cached as a bitmap per file, zoom step (a power of two, in device pixels per point)
+//! and screen colours ([`Ink::Display`], or [`Ink::Press`] in a CMYK document), shared by every
+//! object showing that file. A bitmap not made yet is made on a background worker while the frame
+//! shows another step's bitmap, or a light placeholder; [`generation`] changes when one is ready
+//! and [`busy`] says whether any is coming, so the screen can draw again. Past [`MAX_SIDE`]
+//! pixels, and in outline, proofing and ink frames, it is drawn exactly.
 //!
 //! A document opened with only its placed documents' previews ([`ImageBlob::is_proxy`]) shows them
 //! up to their resolution; past it the file is read again in the background
@@ -38,8 +38,9 @@ const BUDGET: usize = 512 << 20;
 /// The smallest zoom step (device pixels per point).
 const MIN_STEP: f64 = 1.0 / 64.0;
 
-/// A bitmap's identity: the file shown (its key) and the zoom step's bits.
-type BitmapKey = (String, u64);
+/// A bitmap's identity: the file shown (its key), the zoom step's bits and what it paints for
+/// colours (a CMYK document's frames show inks, [`Ink::Press`]).
+type BitmapKey = (String, u64, Ink);
 
 struct Bitmap {
     pm: Arc<Pixmap>,
@@ -95,11 +96,11 @@ impl Bitmaps {
         Some(b.pm.clone())
     }
 
-    /// The bitmap of another step of the same file, the nearest to `step`.
-    fn nearest(&self, key: &str, step: f64) -> Option<(Arc<Pixmap>, f64)> {
+    /// The bitmap of another step of the same file painted with `ink`, the nearest to `step`.
+    fn nearest(&self, key: &str, step: f64, ink: Ink) -> Option<(Arc<Pixmap>, f64)> {
         self.map
             .iter()
-            .filter(|((k, _), _)| k == key)
+            .filter(|((k, _, i), _)| k == key && *i == ink)
             .min_by(|a, b| (a.1.step / step).log2().abs().total_cmp(&(b.1.step / step).log2().abs()))
             .map(|(_, b)| (b.pm.clone(), b.step))
     }
@@ -161,14 +162,27 @@ fn depth() -> usize {
 /// Render `art` of a placed document's file (`doc`, its resources) into `w`×`h` transparent
 /// pixels through `view`, the placed documents inside it one level deeper.
 pub fn render_inside(r: &mut Renderer, doc: &vectorcraft_doc::Document, art: &Arc<Node>, w: u16, h: u16, view: Affine) -> Option<crate::Rendered> {
-    let _inside = Inside::enter();
-    r.render_node(doc, art, w, h, view)
+    render_inside_as(r, doc, art, w, h, view, Ink::Display)
 }
 
-/// `object`'s file (`blob`) as a bitmap of `step` device pixels per point of its box: from its
-/// preview when that is all there is and is fine enough, else from the file (read again when
-/// needed; the preview when it can't be).
-fn make(r: &mut Renderer, object: &PlacedDocument, blob: &ImageBlob, step: f64) -> Option<Pixmap> {
+/// [`render_inside`], colours as `ink` paints them.
+fn render_inside_as(
+    r: &mut Renderer,
+    doc: &vectorcraft_doc::Document,
+    art: &Arc<Node>,
+    w: u16,
+    h: u16,
+    view: Affine,
+    ink: Ink,
+) -> Option<crate::Rendered> {
+    let _inside = Inside::enter();
+    r.render_node_as(doc, art, w, h, view, ink)
+}
+
+/// `object`'s file (`blob`) as a bitmap of `step` device pixels per point of its box, colours as
+/// `ink` paints them: from its preview when that is all there is and is fine enough, else from the
+/// file (read again when needed; the preview when it can't be).
+fn make(r: &mut Renderer, object: &PlacedDocument, blob: &ImageBlob, step: f64, ink: Ink) -> Option<Pixmap> {
     let (w, h) = (pixels(object.width * step), pixels(object.height * step));
     let preview = if blob.is_proxy() { Some(blob.bytes.clone()) } else { blob.proxy.clone() };
     let full = match blob.is_proxy() {
@@ -177,11 +191,14 @@ fn make(r: &mut Renderer, object: &PlacedDocument, blob: &ImageBlob, step: f64) 
         false => Some(blob.bytes.clone()),
     };
     let read = full.and_then(|bytes| vectorcraft_doc::placed_document::read(object, &bytes));
-    let Some(e) = read else { return crate::paint::decode_pixmap_fit(&preview?, w, h) };
+    let Some(e) = read else {
+        let pm = crate::paint::decode_pixmap_fit(&preview?, w, h)?;
+        return Some(if ink.press() { crate::ink::press_pixels(&pm) } else { pm });
+    };
     let f = e.frame;
     let (sx, sy) = (w as f64 / f.width(), h as f64 / f.height());
     let view = Affine::scale_non_uniform(sx, sy) * Affine::translate((-f.x0, -f.y0));
-    let img = render_inside(r, &e.doc, &e.art, w, h, view)?;
+    let img = render_inside_as(r, &e.doc, &e.art, w, h, view, ink)?;
     let data = img.pixels.as_chunks::<4>().0.iter().map(|&[r, g, b, a]| vello_cpu::color::PremulRgba8 { r, g, b, a }).collect();
     Some(Pixmap::from_parts(data, w, h))
 }
@@ -193,7 +210,7 @@ fn pixels(v: f64) -> u16 {
 
 /// Make `job`'s bitmap and keep it.
 fn run(r: &mut Renderer, job: Job) {
-    if let Some(pm) = make(r, &job.object, &job.blob, job.step) {
+    if let Some(pm) = make(r, &job.object, &job.blob, job.step, job.key.2) {
         lock(&BITMAPS).insert(job.key.clone(), pm, job.step);
     }
     lock(&PENDING).remove(&job.key);
@@ -263,7 +280,7 @@ fn mean_scale(a: Affine) -> f64 {
 impl Renderer {
     /// Draw placed document `p` in frame `f`: from a cached bitmap on screen, else exactly.
     pub(crate) fn draw_placed(&mut self, ctx: &mut RenderContext, f: &Frame, p: &PlacedDocument) {
-        let plain = f.ink == Ink::Display && !f.opts.outline && f.opts.proof.is_none() && !f.opts.overprint_preview;
+        let plain = matches!(f.ink, Ink::Display | Ink::Press) && !f.opts.outline && f.opts.proof.is_none() && !f.opts.overprint_preview;
         if f.opts.progressive_placed && plain && depth() == 0 && self.draw_placed_bitmap(ctx, f, p) {
             return;
         }
@@ -307,11 +324,11 @@ impl Renderer {
             return false;
         }
         let Some(blob) = f.doc.images.get(&p.key).cloned() else { return true };
-        let key = (p.key.clone(), step.to_bits());
+        let key = (p.key.clone(), step.to_bits(), f.ink);
         let (found, nearest) = {
             let mut b = lock(&BITMAPS);
             let found = b.get(&key);
-            let nearest = if found.is_none() { b.nearest(&p.key, step) } else { None };
+            let nearest = if found.is_none() { b.nearest(&p.key, step, f.ink) } else { None };
             (found, nearest)
         };
         let shown = match found {
@@ -320,7 +337,7 @@ impl Renderer {
                 schedule(Job { key, object: p.clone(), blob, step });
                 // Made here and now (no threads) or meanwhile another step's.
                 let mut b = lock(&BITMAPS);
-                b.get(&(p.key.clone(), step.to_bits())).or(nearest.map(|n| n.0))
+                b.get(&(p.key.clone(), step.to_bits(), f.ink)).or(nearest.map(|n| n.0))
             }
         };
         let rect = Rect::new(0.0, 0.0, p.width, p.height);

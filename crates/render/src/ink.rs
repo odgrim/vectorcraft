@@ -11,7 +11,9 @@
 //! profile (a cached 4-D lookup table). Opacity masks keep taking their luminance from screen
 //! colours; RGB colours and placed images are separated into the working CMYK space first.
 //!
-//! RGB documents, and CMYK documents without transparency, draw screen colours ([`Ink::Display`]).
+//! RGB documents draw screen colours ([`Ink::Display`]). CMYK documents without transparency draw
+//! each colour as the ink planes show it ([`Ink::Press`]), so transparency anywhere on the page
+//! changes no other colour (#1978).
 
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -42,16 +44,99 @@ pub(crate) enum Ink {
     K,
     /// Screen colours, with pure CMYK black as RGB black ([`RenderOptions::rich_black`]).
     RichBlack,
+    /// Each colour's inks shown through the working CMYK profile, as the ink planes show them:
+    /// RGB, Lab and grey separated as for the planes, gradients and images mixed as inks.
+    Press,
+    /// [`Ink::Press`], with pure CMYK black as RGB black.
+    PressRichBlack,
+}
+
+/// How many times [`Ink::Press`] halves the ramp between two gradient stops at most: the first
+/// two halvings always, the others where a straight line strays from the inks' colours.
+const MIX_DEPTH: u32 = 7;
+
+/// The colours of ramp `at` (0..1 → colour) between `a` and `b` (each a place on it and its
+/// colour), in order: the middle and those on each side of it, unless a straight line from `a` to
+/// `b` is within half a level of the middle or `depth` runs out.
+fn mix(at: &dyn Fn(f32) -> [f32; 3], a: (f32, [f32; 3]), b: (f32, [f32; 3]), depth: u32, out: &mut Vec<(f32, [f32; 3])>) {
+    let t = (a.0 + b.0) / 2.0;
+    let c = at(t);
+    let straight = (0..3).all(|n| (c[n] - (a.1[n] + b.1[n]) / 2.0).abs() <= 0.5 / 255.0);
+    if depth == 0 || (straight && depth < MIX_DEPTH - 1) {
+        return;
+    }
+    mix(at, a, (t, c), depth - 1, out);
+    out.push((t, c));
+    mix(at, (t, c), b, depth - 1, out);
 }
 
 impl Ink {
+    /// What a frame paints for colours when it doesn't paint ink planes: [`Ink::Press`] when its
+    /// colours show as their inks ([`shows_inks`]), else screen colours.
+    pub(crate) fn screen(inks: bool, rich_black: bool) -> Self {
+        match (inks, rich_black) {
+            (false, false) => Ink::Display,
+            (false, true) => Ink::RichBlack,
+            (true, false) => Ink::Press,
+            (true, true) => Ink::PressRichBlack,
+        }
+    }
+
+    /// Whether this is [`Ink::Press`] (with or without rich black).
+    pub(crate) fn press(self) -> bool {
+        matches!(self, Ink::Press | Ink::PressRichBlack)
+    }
+
     /// The three values painted for colour `c`.
     pub(crate) fn rgb(self, c: &Color) -> [f32; 3] {
         match (self, *c) {
             (Ink::RichBlack, Color::Cmyk { c, m, y, k }) if is_pure_black([c, m, y, k]) => [0.0; 3],
             (Ink::Display | Ink::RichBlack, _) => c.to_rgb(),
-            _ => self.plane(inks(c)),
+            (Ink::Press | Ink::PressRichBlack, _) => self.shown(inks(c)),
+            (Ink::Cmy | Ink::K, _) => self.plane(inks(c)),
         }
+    }
+
+    /// How [`Ink::Press`] shows inks `inks`: as the CMYK colour of those inks shows.
+    fn shown(self, [c, m, y, k]: [f32; 4]) -> [f32; 3] {
+        if self == Ink::PressRichBlack && is_pure_black([c, m, y, k]) {
+            return [0.0; 3];
+        }
+        Color::Cmyk { c, m, y, k }.to_rgb()
+    }
+
+    /// [`Self::shown`] through `lut` (what the ink planes are composed through), for the many inks
+    /// of a field or a ramp.
+    pub(crate) fn shown_by(self, lut: &InkLut, inks: [f32; 4]) -> [f32; 3] {
+        if self == Ink::PressRichBlack && is_pure_black(inks) {
+            return [0.0; 3];
+        }
+        lut.apply(inks)
+    }
+
+    /// Gradient stops `stops` (offset, colour, opacity) as painted. The ink planes mix inks
+    /// between two stops, so [`Ink::Press`] adds stops showing the inks in between, as many as
+    /// it takes to follow them within half a level.
+    pub(crate) fn stops(self, stops: &[(f32, Color, f32)]) -> Vec<peniko::ColorStop> {
+        let mut out = Vec::with_capacity(stops.len());
+        let mut lut = None;
+        let mut mixes = vec![];
+        for (i, &(o0, c0, a0)) in stops.iter().enumerate() {
+            out.push((o0, self.color(&c0, a0)).into());
+            let Some(&(o1, c1, a1)) = stops.get(i + 1).filter(|_| self.press()) else { continue };
+            let (from, to) = (inks(&c0), inks(&c1));
+            if from == to || o1 - o0 <= f32::EPSILON {
+                continue;
+            }
+            let (lut, _) = lut.get_or_insert_with(display_lut);
+            let at = |t: f32| self.shown_by(lut, std::array::from_fn(|n| from[n] + (to[n] - from[n]) * t));
+            mixes.clear();
+            mix(&at, (0.0, at(0.0)), (1.0, at(1.0)), MIX_DEPTH, &mut mixes);
+            for &(t, [r, g, b]) in &mixes {
+                out.push((o0 + (o1 - o0) * t, peniko::Color::from_rgba8(q(r), q(g), q(b), q(a0 + (a1 - a0) * t))).into());
+            }
+        }
+        out
     }
 
     /// [`Self::rgb`] as a paint, at `alpha`.
@@ -68,8 +153,8 @@ impl Ink {
 
     fn fixed8(self, [r, g, b, a]: [u8; 4]) -> [u8; 4] {
         match self {
-            Ink::Display | Ink::RichBlack => [r, g, b, a],
-            _ => {
+            Ink::Display | Ink::RichBlack | Ink::Press | Ink::PressRichBlack => [r, g, b, a],
+            Ink::Cmy | Ink::K => {
                 let lab = lab::srgb_to_lab([r, g, b].map(|v| v as f32 / 255.0));
                 let [r, g, b] = self.plane(inks(&Color::Lab { l: lab.l, a: lab.a, b: lab.b })).map(q);
                 [r, g, b, a]
@@ -91,14 +176,17 @@ fn is_pure_black([c, m, y, k]: [f32; 4]) -> bool {
     c <= 0.0 && m <= 0.0 && y <= 0.0 && k >= 1.0
 }
 
+/// Whether `doc`'s colours show as their inks: a CMYK document, unless drawn in Outline view or
+/// Separations Preview (which paints plates).
+pub(crate) fn shows_inks(doc: &Document, opts: &RenderOptions) -> bool {
+    doc.color_mode == ColorMode::Cmyk && !opts.outline && opts.proof.as_ref().is_none_or(|p| p.separations.is_none())
+}
+
 impl Renderer {
-    /// Whether `doc` is drawn by ink planes: a CMYK document that shows transparency, unless drawn
-    /// in Outline view or Separations Preview (which paints plates).
+    /// Whether `doc` is drawn by ink planes: its colours show as their inks ([`shows_inks`]) and it
+    /// shows transparency.
     pub(crate) fn blends_in_cmyk(&mut self, doc: &Document, opts: &RenderOptions) -> bool {
-        doc.color_mode == ColorMode::Cmyk
-            && !opts.outline
-            && opts.proof.as_ref().is_none_or(|p| p.separations.is_none())
-            && self.shows_transparency(doc)
+        shows_inks(doc, opts) && self.shows_transparency(doc)
     }
 
     /// Whether `doc`'s layers, symbol art or pattern art show transparency
@@ -130,13 +218,17 @@ fn inks(c: &Color) -> [f32; 4] {
     let cms = cms::active();
     SEPARATED.with(|s| {
         let (owner, seen) = &mut *s.borrow_mut();
-        if !owner.as_ref().is_some_and(|o| Arc::ptr_eq(o, &cms)) || seen.len() >= 4096 {
+        if !owner.as_ref().is_some_and(|o| Arc::ptr_eq(o, &cms)) || seen.len() >= MAX_SEPARATED {
             seen.clear();
             *owner = Some(cms.clone());
         }
         *seen.entry(key).or_insert_with(|| cms.to_cmyk(c, cms.settings().intent))
     })
 }
+
+/// How many separated colours a thread keeps: a document with more RGB and Lab colours than this
+/// separates them all again in every frame (a few microseconds each).
+const MAX_SEPARATED: usize = 1 << 16;
 
 /// Separated colours, for the colour settings they were separated with.
 type Separated = (Option<Arc<Cms>>, HashMap<[u32; 4], [f32; 4]>);
@@ -174,6 +266,8 @@ static GENERATION: AtomicU64 = AtomicU64::new(0);
 static DISPLAY: Cached<InkLut> = Mutex::new(None);
 /// Screen colours → [`Ink::Cmy`] and [`Ink::K`] values (placed images).
 static SEPARATE: Cached<[ProofLut; 2]> = Mutex::new(None);
+/// Screen colours → [`Ink::Press`] values (placed images).
+static PRESS: Cached<ProofLut> = Mutex::new(None);
 
 /// The table in `slot` for the active colour settings, built by `build` when they changed, and
 /// its generation.
@@ -312,8 +406,14 @@ pub(crate) fn cmyk_pixmap(blob: &ImageBlob, lut: &InkLut) -> Option<Pixmap> {
 /// Image pixels `pm` (cached as `key`, from `blob` when it is a document's image as it is) as
 /// painted with `ink`, cached with the images, and their key.
 pub(crate) fn ink_image(key: &ImageKey, pm: &Arc<Pixmap>, ink: Ink, blob: Option<&ImageBlob>, touch: bool) -> (ImageKey, Arc<Pixmap>) {
-    if matches!(ink, Ink::Display | Ink::RichBlack) {
-        return (key.clone(), pm.clone());
+    // CMYK images (shown through the display table) paint their own inks; the others are separated.
+    let cmyk = key.luts.0 != 0 && key.adjust.is_none() && !key.grey;
+    match ink {
+        Ink::Display | Ink::RichBlack => return (key.clone(), pm.clone()),
+        // A CMYK image shows its own inks already.
+        Ink::Press | Ink::PressRichBlack if cmyk => return (key.clone(), pm.clone()),
+        Ink::Press | Ink::PressRichBlack => return press_image(key, pm, touch),
+        Ink::Cmy | Ink::K => {}
     }
     let (luts, generation) = cached(&SEPARATE, |cms| {
         let intent = cms.settings().intent;
@@ -328,36 +428,67 @@ pub(crate) fn ink_image(key: &ImageKey, pm: &Arc<Pixmap>, ink: Ink, blob: Option
     if let Some(p) = hit {
         return (want, p);
     }
-    // CMYK images (shown through the display table) paint their own inks; the others are separated.
     let size = (pm.width() as u32, pm.height() as u32);
-    let cmyk = key.luts.0 != 0 && key.adjust.is_none() && !key.grey;
     let inks = blob.filter(|_| cmyk).and_then(ImageBlob::cmyk).filter(|i| (i.width, i.height) == size);
     let planes = [Ink::Cmy, Ink::K].map(|plane| {
-        let mut out = Pixmap::new(pm.width(), pm.height());
         if let Some(inks) = &inks {
+            let mut out = Pixmap::new(pm.width(), pm.height());
             for (o, p) in out.data_mut().iter_mut().zip(inks.data.as_chunks::<4>().0) {
                 let [r, g, b] = plane.plane(p.map(|v| v as f32 / 255.0)).map(q);
                 *o = PremulRgba8 { r, g, b, a: 255 };
             }
             return Arc::new(out);
         }
-        let lut = &luts[(plane == Ink::K) as usize];
-        for (o, s) in out.data_mut().iter_mut().zip(pm.data()) {
-            let a = s.a;
-            if a == 0 {
-                continue;
-            }
-            let un = |v: u8| (v as f32 / a as f32).min(1.0);
-            let [r, g, b] = lut.apply([un(s.r), un(s.g), un(s.b)]).map(|v| (v.clamp(0.0, 1.0) * a as f32).round() as u8);
-            *o = PremulRgba8 { r, g, b, a };
-        }
-        Arc::new(out)
+        Arc::new(through(pm, &luts[(plane == Ink::K) as usize]))
     });
     let [cmy, k] = planes;
     let mut s = images::store();
     let cmy = s.insert(plane_key(Ink::Cmy), cmy);
     let k = s.insert(plane_key(Ink::K), k);
     (want, if ink == Ink::K { k } else { cmy })
+}
+
+/// The table [`Ink::Press`] shows screen colours through: separated with the colour settings'
+/// intent, then shown as their inks.
+fn press_lut(cms: &Cms) -> ProofLut {
+    let intent = cms.settings().intent;
+    ProofLut::build(|rgb| cms.cmyk_to_srgb(cms.srgb_to_cmyk(rgb, intent), false))
+}
+
+/// Screen-colour pixels `pm` as [`Ink::Press`] paints them.
+pub(crate) fn press_pixels(pm: &Pixmap) -> Pixmap {
+    through(pm, &cached(&PRESS, press_lut).0)
+}
+
+/// Image pixels `pm` (cached as `key`) as [`Ink::Press`] paints them, cached with the images, and
+/// their key.
+fn press_image(key: &ImageKey, pm: &Arc<Pixmap>, touch: bool) -> (ImageKey, Arc<Pixmap>) {
+    let (lut, generation) = cached(&PRESS, press_lut);
+    let want = ImageKey { ink: Ink::Press, luts: (key.luts.0, generation), ..key.clone() };
+    let hit = {
+        let mut s = images::store();
+        if touch { s.get(&want) } else { s.peek(&want) }
+    };
+    if let Some(p) = hit {
+        return (want, p);
+    }
+    let shown = images::store().insert(want.clone(), Arc::new(through(pm, &lut)));
+    (want, shown)
+}
+
+/// Premultiplied pixels `pm` with each colour put through `lut`.
+fn through(pm: &Pixmap, lut: &ProofLut) -> Pixmap {
+    let mut out = Pixmap::new(pm.width(), pm.height());
+    for (o, s) in out.data_mut().iter_mut().zip(pm.data()) {
+        let a = s.a;
+        if a == 0 {
+            continue;
+        }
+        let un = |v: u8| (v as f32 / a as f32).min(1.0);
+        let [r, g, b] = lut.apply([un(s.r), un(s.g), un(s.b)]).map(|v| (v.clamp(0.0, 1.0) * a as f32).round() as u8);
+        *o = PremulRgba8 { r, g, b, a };
+    }
+    out
 }
 
 #[cfg(test)]

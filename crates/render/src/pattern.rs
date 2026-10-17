@@ -93,7 +93,7 @@ struct TileEntry {
 
 struct PatternCache {
     /// Per ink ([`Ink`] as index), each within [`lru::PATTERN_BUDGET`], least recently used first out.
-    tiles: [FrameCache<TileKey, TileEntry>; 4],
+    tiles: [FrameCache<TileKey, TileEntry>; 6],
     renderer: Option<Box<Renderer>>,
     depth: u32,
     /// The plug-in revision ([`crate::effects::plugin_revision`]) the tiles were last checked

@@ -3,7 +3,7 @@
 use vectorcraft_color::{GradientKind, Paint};
 use vectorcraft_geom::{Rect, Vec2};
 use vello_cpu::RenderContext;
-use vello_cpu::peniko::{self, ColorStop};
+use vello_cpu::peniko;
 
 use crate::Frame;
 
@@ -19,7 +19,7 @@ pub(crate) fn set_paint(ctx: &mut RenderContext, p: &Paint, bounds: Rect, f: &Fr
         Paint::Gradient(g) if g.gradient.kind == GradientKind::Freeform => crate::freeform::set_freeform_paint(ctx, g, bounds, f.ink),
         Paint::Gradient(g) => {
             let geom = g.resolve(bounds);
-            let stops: Vec<ColorStop> = g.gradient.expanded_stops().iter().map(|(o, c, a)| ColorStop::from((*o, f.ink.color(c, *a)))).collect();
+            let stops = f.ink.stops(&g.gradient.expanded_stops());
             if stops.is_empty() {
                 return false;
             }
